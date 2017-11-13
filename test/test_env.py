@@ -23,7 +23,6 @@ def test_gym_env(spec_id):
 def test_env_outputs(spec_id):
     """Check outputs."""
     env = gym.envs.spec(spec_id).make()
-    np.random.seed(0)
     env.seed(0)
 
     action = env.action_space.sample()
@@ -32,7 +31,8 @@ def test_env_outputs(spec_id):
     obs1, reward, done, info = env.step(action)
     obs2 = env.reset()
 
-    assert obs1.shape == obs2.shape, 'rest and step should output same shaped observations'
+    assert obs1["history"].shape == obs2["history"].shape, 'rest and step should output same shaped observations'
+    assert obs1["weights"].shape == obs2["weights"].shape, 'rest and step should output same shaped observations'
     assert env.observation_space.contains(
         obs1), 'state should be within observation space'
     assert np.isfinite(reward), 'reward should be finite'
@@ -47,7 +47,6 @@ def test_env_outputs(spec_id):
 def test_portfolio_env_random_agent(spec_id):
     """Test random actions for 20 steps."""
     env = gym.envs.spec(spec_id).make()
-    np.random.seed(0)
     env.seed(0)
 
     obs = env.reset()
@@ -64,15 +63,15 @@ def test_portfolio_env_random_agent(spec_id):
 
     df_info = pd.DataFrame(env.infos)
     final_value = df_info.portfolio_value.iloc[-1]
-    assert final_value > 0.75, 'should retain most value with 20 random steps'
-    assert final_value < 1.10, 'should retain most value with 20 random steps'
+    market_value = df_info.market_value.iloc[-1]
+    np.testing.assert_allclose(final_value, market_value, rtol=0.1,
+                               err_msg='should be similar to market values after 20 random steps')
 
 
 @pytest.mark.parametrize("spec_id", env_specs)
 def test_portfolio_env_hold(spec_id):
     """Test that holding cash gives stable value."""
     env = gym.envs.spec(spec_id).make()
-    np.random.seed(0)
     env.seed(0)
     env.reset()
     for _ in range(5):
@@ -85,26 +84,53 @@ def test_portfolio_env_hold(spec_id):
     assert df.portfolio_value.iloc[-1] < 1.01, 'portfolio should retain value if holding bitcoin'
 
 
-def test_scaled():
-    """Test env with scaled and not scaled option."""
-    df = pd.read_hdf('./data/poloniex_30m.hf', key='train')
-
-    np.random.seed(0)
-    env1 = PortfolioEnv(df=df, scale=True)
+def test_scaled_non_price_cols():
+    """Test env with scaled option."""
+    df = pd.read_hdf('./data/poloniex_30m_vol.hf', key='train')
+    env1 = PortfolioEnv(df=df, scale=True, window_length=len(df) - 300)
+    env1.seed(0)
     obs1 = env1.reset()
 
-    np.random.seed(0)
-    env0 = PortfolioEnv(df=df, scale=False)
+    nb_cols = len(env1.src.features)
+    nb_price_cols = len(env1.src.price_columns)
+    means = obs1["history"].reshape((-1, nb_cols)).mean(0)
+    stds = obs1["history"].reshape((-1, nb_cols)).std(0)
+
+    non_price_means = means[nb_price_cols:]
+
+    # if normalized: for a large window, mean non_prices should be near mean=0, std=1
+    non_price_std = stds[nb_price_cols:]
+    np.testing.assert_almost_equal(non_price_means, [
+                                   0, 0], decimal=1, err_msg='non price columns should be normalized to be close to one')
+    np.testing.assert_allclose(non_price_std, [
+                               1, 1], rtol=0.1, err_msg='non price columns should be normalized to be close to one')
+
+
+def test_scaled():
+    """Test env with scaled option."""
+    df = pd.read_hdf('./data/poloniex_30m_vol.hf', key='train')
+
+    env0 = PortfolioEnv(df=df, scale=False, window_length=40)
+    env0.seed(0)
     obs0 = env0.reset()
 
-    assert obs0 != obs1
+    env1 = PortfolioEnv(df=df, scale=True, window_length=40)
+    env1.seed(0)
+    obs1 = env1.reset()
+
+    nb_price_cols = len(env1.src.price_columns)
+    assert (obs0["history"][:, :, :nb_price_cols] != obs1["history"][:, :,
+                                                                     :nb_price_cols]).all(), 'scaled and non-scaled data should differ'
+
+    # if scaled by last opening price: for a small window, mean prices should be near 1
+    np.testing.assert_allclose(obs1["history"][:, -1, :nb_price_cols], 1,
+                               rtol=0.1, err_msg='last prices should be normalized to be close to one')
 
 
 @pytest.mark.parametrize("spec_id", env_specs)
 def test_invalid_actions(spec_id):
     """Test that holding cash gives stable value."""
     env = gym.envs.spec(spec_id).make()
-    np.random.seed(0)
     env.seed(0)
     env.reset()
 
@@ -130,3 +156,20 @@ def test_invalid_actions(spec_id):
             pass
         else:
             raise Exception('Expected error for invalid action %s' % action)
+
+
+@pytest.mark.parametrize("spec_id", env_specs)
+def test_costs(spec_id):
+    """Test that simple transaction have the cost we expect."""
+    env = gym.envs.spec(spec_id).make()
+    env.seed(0)
+
+    env.reset()
+    obs, reward, done, info = env.step(np.array([1, 0, 0, 0]))
+    obs, reward, done, info = env.step(np.array([0, 1, 0, 0]))
+    np.testing.assert_almost_equal(
+        info['cost'], env.sim.cost, err_msg='trading 100% cash for asset1 should cost 1*trading_cost')
+
+    obs, reward, done, info = env.step(np.array([0, 0, 1, 0]))
+    np.testing.assert_almost_equal(
+        info['cost'], env.sim.cost * 2, err_msg='trading 100% asset1 for asset2 should cost 2*trading_cost')

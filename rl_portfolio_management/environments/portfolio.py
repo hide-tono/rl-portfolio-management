@@ -4,7 +4,8 @@ from matplotlib import pyplot as plt
 from pprint import pprint
 import logging
 import os
-
+import tempfile
+import time
 import gym
 import gym.spaces
 
@@ -19,63 +20,93 @@ logger = logging.getLogger(__name__)
 class DataSrc(object):
     """Acts as data provider for each new episode."""
 
-    def __init__(self, df, steps=252, scale=True, augment=0.00, window_length=50):
+    def __init__(self, df, steps=252, scale=True, scale_extra_cols=True, augment=0.00, window_length=50):
         """
         DataSrc.
 
         df - csv for data frame index of timestamps
-             and multi-index columns levels=[['LTCBTC'],...],['open','low','high','close']]
+             and multi-index columns levels=[['LTCBTC'],...],['open','low','high','close',...]]
+             an example is included as an hdf file in this repository
         steps - total steps in episode
         scale - scale the data for each episode
+        scale_extra_cols - scale extra columns by global mean and std
         augment - fraction to augment the data by
         """
         self.steps = steps + 1
         self.augment = augment
         self.scale = scale
+        self.scale_extra_cols = scale_extra_cols
         self.window_length = window_length
 
-        df = df.copy()
-
         # get rid of NaN's
+        df = df.copy()
         df.replace(np.nan, 0, inplace=True)
         df = df.fillna(method="pad")
 
-        self._data = df.copy()
-        self.asset_names = self._data.columns.levels[0].tolist()
+        # dataframe to matrix
+        self.asset_names = df.columns.levels[0].tolist()
+        self.features = df.columns.levels[1].tolist()
+        data = df.as_matrix().reshape(
+            (len(df), len(self.asset_names), len(self.features)))
+        self._data = np.transpose(data, (1, 0, 2))
+        self._times = df.index
+
+        self.price_columns = ['close', 'high', 'low', 'open']
+        self.non_price_columns = set(
+            df.columns.levels[1]) - set(self.price_columns)
+
+        # Stats to let us normalize non price columns
+        if scale_extra_cols:
+            x = self._data.reshape((-1, len(self.features)))
+            self.stats = dict(mean=x.mean(0), std=x.std(0))
+            # for column in self._data.columns.levels[1].tolist():
+            #     x = df.xs(key=column, axis=1, level='Price').as_matrix()[:, :]
+            #     self.stats["mean"].append(x.mean())
+            #      = dict(mean=x.mean(), std=x.std())
 
         self.reset()
 
     def _step(self):
-        # get observation matrix from dataframe
-        data_window = self.data.iloc[self.step:self.step +
-                                     self.window_length].copy()
+        # get history matrix from dataframe
+        data_window = self.data[:, self.step:self.step +
+                                self.window_length].copy()
 
-        # (eq 18) prices are divided by open price
-        # While the paper says open/close, it only makes sense with close/open
+        # (eq 18) prices are divided by close price
+        nb_pc = len(self.price_columns)
         if self.scale:
-            open = data_window.xs('open', axis=1, level='Price')
-            data_window = data_window.divide(open.iloc[-1], level='Pair')
-            data_window = data_window.drop('open', axis=1, level='Price')
+            # scale prices by dividing price columns by the 2nd to last close price
+            # last close price (asset='*', time=-2, feature=0)
+            last_close_price = data_window[:, -2, 0]
+            data_window[:, :, :nb_pc] /= last_close_price[:,
+                                                          np.newaxis, np.newaxis]
 
-        # convert to matrix (window, assets, prices)
-        obs = np.array([data_window[asset].as_matrix()
-                        for asset in self.asset_names])
+        if self.scale_extra_cols:
+            # normalize non price columns
+            data_window[:, :, nb_pc:] -= self.stats["mean"][None, None, nb_pc:]
+            data_window[:, :, nb_pc:] /= self.stats["std"][None, None, nb_pc:]
+            data_window[:, :, nb_pc:] = np.clip(
+                data_window[:, :, nb_pc:],
+                self.stats["mean"][nb_pc:] - self.stats["std"][nb_pc:] * 10,
+                self.stats["mean"][nb_pc:] + self.stats["std"][nb_pc:] * 10
+            )
 
         self.step += 1
         done = bool(self.step >= self.steps)
-        return obs, done
+        return data_window, done
 
     def reset(self):
         self.step = 0
 
         # get data for this episode
         self.idx = np.random.randint(
-            low=self.window_length, high=len(self._data.index) - self.steps)
-        data = self._data[self.idx -
+            low=self.window_length, high=self._data.shape[1] - self.steps)
+        data = self._data[:, self.idx -
                           self.window_length:self.idx + self.steps + 1].copy()
+        self.times = self._times[self.idx -
+                                 self.window_length:self.idx + self.steps + 1]
 
         # augment data to prevent overfitting
-        data = data.apply(lambda x: random_shift(x, self.augment))
+        data += np.random.normal(loc=0, scale=self.augment, size=data.shape)
 
         self.data = data
 
@@ -111,18 +142,22 @@ class PortfolioSim(object):
 
         dw1 = (y1 * w0) / (np.dot(y1, w0) + eps)  # (eq7) weights evolve into
 
+        # (eq16) cost to change portfolio
+        # (excluding change in cash to avoid double counting for transaction cost)
         mu1 = self.cost * (
-            np.abs(dw1 - w1)).sum()  # (eq16) cost to change portfolio
+            np.abs(dw1[1:] - w1[1:])).sum()
 
         p1 = p0 * (1 - mu1) * np.dot(y1, w0)  # (eq11) final portfolio value
 
         p1 = p1 * (1 - self.time_cost)  # we can add a cost to holding
 
-        p1 = np.clip(p1, 0, np.inf)  # can't have negative holdings in this model (no shorts)
+        # can't have negative holdings in this model (no shorts)
+        p1 = np.clip(p1, 0, np.inf)
 
         rho1 = p1 / p0 - 1  # rate of returns
         r1 = np.log((p1 + eps) / (p0 + eps))  # (eq10) log rate of return
-        reward = r1 / self.steps  # (eq22) immediate reward is log rate of return scaled by episode length
+        # (eq22) immediate reward is log rate of return scaled by episode length
+        reward = r1 / self.steps
 
         # remember for next step
         self.w0 = w1
@@ -143,16 +178,16 @@ class PortfolioSim(object):
             "cost": mu1,
         }
         # record weights and prices
-        for i in range(len(self.asset_names)):
-            info['weight_' + self.asset_names[i]] = w1[i]
-            info['price_' + self.asset_names[i]] = y1[i]
+        for i, name in enumerate(['BTCBTC'] + self.asset_names):
+            info['weight_' + name] = w1[i]
+            info['price_' + name] = y1[i]
 
         self.infos.append(info)
         return reward, info, done
 
     def reset(self):
         self.infos = []
-        self.w0 = np.array([1.0] + [0.0] * (len(self.asset_names) - 1))
+        self.w0 = np.array([1.0] + [0.0] * len(self.asset_names))
         self.p0 = 1.0
 
 
@@ -171,12 +206,14 @@ class PortfolioEnv(gym.Env):
     def __init__(self,
                  df,
                  steps=256,
-                 scale=True,
-                 augment=0.00,
                  trading_cost=0.0025,
                  time_cost=0.00,
                  window_length=50,
-                 output_mode='EIIE'
+                 augment=0.00,
+                 output_mode='EIIE',
+                 log_dir=None,
+                 scale=True,
+                 scale_extra_cols=True,
                  ):
         """
         An environment for financial portfolio management.
@@ -185,17 +222,19 @@ class PortfolioEnv(gym.Env):
             df - csv for data frame index of timestamps
                  and multi-index columns levels=[['LTCBTC'],...],['open','low','high','close']]
             steps - steps in episode
-            scale - scale data and each episode (except return)
-            augment - fraction to randomly shift data by
+            window_length - how many past observations["history"] to return
             trading_cost - cost of trade as a fraction,  e.g. 0.0025 corresponding to max rate of 0.25% at Poloniex (2017)
             time_cost - cost of holding as a fraction
-            window_length - how many past observations to return
-            output_mode: decides observation shape
-                - 'EIIE' for (assets, window, 3)
-                - 'atari' for (window, window, 3) (assets is padded)
-                - 'mlp' for (assets*window*3)
+            augment - fraction to randomly shift data by
+            output_mode: decides observation["history"] shape
+            - 'EIIE' for (assets, window, 3)
+            - 'atari' for (window, window, 3) (assets is padded)
+            - 'mlp' for (assets*window*3)
+            log_dir: directory to save plots to
+            scale - scales price data by last opening price on each episode (except return)
+            scale_extra_cols - scales non price data using mean and std for whole dataset
         """
-        self.src = DataSrc(df=df, steps=steps, scale=scale,
+        self.src = DataSrc(df=df, steps=steps, scale=scale, scale_extra_cols=scale_extra_cols,
                            augment=augment, window_length=window_length)
         self._plot = self._plot2 = self._plot3 = None
         self.output_mode = output_mode
@@ -204,37 +243,42 @@ class PortfolioEnv(gym.Env):
             trading_cost=trading_cost,
             time_cost=time_cost,
             steps=steps)
+        self.log_dir = log_dir
 
         # openai gym attributes
-        # action will be the portfolio weights from 0 to 1 for each asset
+        # action will be the portfolio weights [cash_bias,w1,w2...] where wn are [0, 1] for each asset
+        nb_assets = len(self.src.asset_names)
         self.action_space = gym.spaces.Box(
-            0.0, 1.0, shape=len(self.src.asset_names))
+            0.0, 1.0, shape=nb_assets + 1)
 
-        # get the observation space from the data min and max
+        # get the history space from the data min and max
         if output_mode == 'EIIE':
             obs_shape = (
-                len(self.src.asset_names) - 1,  # don't observe cash column
+                nb_assets,
                 window_length,
-                len(self.src._data.columns.levels[1]) - 1
+                len(self.src.features)
             )
         elif output_mode == 'atari':
             obs_shape = (
-                window_length,  # don't observe cash column
                 window_length,
-                len(self.src._data.columns.levels[1]) - 1
+                window_length,
+                len(self.src.features)
             )
         elif output_mode == 'mlp':
-            obs_shape = (len(self.src.asset_names) - 1) * window_length * \
-                (len(self.src._data.columns.levels[1]) - 1)
+            obs_shape = (nb_assets) * window_length * \
+                (len(self.src.features))
         else:
             raise Exception('Invalid value for output_mode: %s' %
                             self.output_mode)
 
-        self.observation_space = gym.spaces.Box(
-            0,
-            2 if scale else 1,  # if scale=True observed price changes return could be large fractions
-            obs_shape
-        )
+        self.observation_space = gym.spaces.Dict({
+            'history': gym.spaces.Box(
+                -10,
+                20 if scale else 1,  # if scale=True observed price changes return could be large fractions
+                obs_shape
+            ),
+            'weights': self.action_space
+        })
         self._reset()
 
     def _step(self, action):
@@ -242,7 +286,7 @@ class PortfolioEnv(gym.Env):
         Step the env.
 
         Actions should be portfolio [w0...]
-        - Where wn is a portfolio weight from 0 to 1. The first is cash_bias
+        - Where wn is a portfolio weight between 0 and 1. The first (w0) is cash_bias
         - cn is the portfolio conversion weights see PortioSim._step for description
         """
         logger.debug('action: %s', action)
@@ -251,51 +295,37 @@ class PortfolioEnv(gym.Env):
         weights /= weights.sum() + eps
 
         # Sanity checks
-        np.testing.assert_almost_equal(
-            action.shape,
-            (len(self.sim.asset_names),),
-            err_msg='Action should contain %s floats, not %s' % (len(self.sim.asset_names), action.shape)
-        )
-        assert ((action >= 0) * (action <= 1)
-                ).all(), 'all action values should be between 0 and 1. Not %s' % action
+        assert self.action_space.contains(
+            action), 'action should be within %r but is %r' % (self.action_space, action)
         np.testing.assert_almost_equal(
             np.sum(weights), 1.0, 3, err_msg='weights should sum to 1. action="%s"' % weights)
 
-        observation, done1 = self.src._step()
+        history, done1 = self.src._step()
 
-        y1 = observation[:, -1, 0]  # relative price vector (open/close)
+        y1 = history[:, -1, 0]  # relative price vector (close/open)
+        y1 = np.concatenate([[1.0], y1])  # add cash price
         reward, info, done2 = self.sim._step(weights, y1)
-
-        # Bit of a HACK. We want it to know last steps porfolio weights
-        # but don't want to make dual inputs so I'll replace the oldest data
-        # with them
-        weight_insert_shape = (observation.shape[0], observation.shape[2])
-        observation[:, 0, :] = np.ones(
-            weight_insert_shape) * weights[:, np.newaxis]
-
-        # remove cash columns, they are just meaningless values
-        observation = observation[1:, :, :]
 
         # calculate return for buy and hold a bit of each asset
         info['market_value'] = np.cumprod(
             [inf["market_return"] for inf in self.infos + [info]])[-1]
         # add dates
-        info['date'] = self.src.data.index[self.src.step].timestamp()
+        info['date'] = self.src.times[self.src.step].timestamp()
         info['steps'] = self.src.step
 
         self.infos.append(info)
 
-        # reshape output
+        # reshape history according to output mode
         if self.output_mode == 'EIIE':
             pass
         elif self.output_mode == 'atari':
-            padding = observation.shape[1] - observation.shape[0]
-            observation = np.pad(observation, [[0, padding], [
-                                 0, 0], [0, 0]], mode='constant')
+            padding = history.shape[1] - history.shape[0]
+            history = np.pad(history, [[0, padding], [
+                0, 0], [0, 0]], mode='constant')
         elif self.output_mode == 'mlp':
-            observation = observation.flatten()
+            history = history.flatten()
 
-        return observation, reward, done1 or done2, info
+        return {'history': history, 'weights': weights}, reward, done1 or done2, info
 
     def _reset(self):
         self.sim.reset()
@@ -304,6 +334,10 @@ class PortfolioEnv(gym.Env):
         action = self.sim.w0
         observation, reward, done, info = self.step(action)
         return observation
+
+    def _seed(self, seed):
+        np.random.seed(seed)
+        return [seed]
 
     def _render(self, mode='notebook', close=False):
         # if close:
@@ -318,26 +352,41 @@ class PortfolioEnv(gym.Env):
 
         if close:
             self._plot = self._plot2 = self._plot3 = None
+            return
 
         df_info = pd.DataFrame(self.infos)
         df_info.index = pd.to_datetime(df_info["date"], unit='s')
 
         # plot prices and performance
+        all_assets = ['BTCBTC'] + self.sim.asset_names
         if not self._plot:
+            self._plot_dir = os.path.join(
+                self.log_dir, 'notebook_plot_prices_' + str(time.time())) if self.log_dir else None
             self._plot = LivePlotNotebook(
-                '/tmp', title='prices & performance', labels=self.sim.asset_names + ["Portfolio"], ylabel='value')
+                log_dir=self._plot_dir, title='prices & performance', labels=all_assets + ["Portfolio"], ylabel='value')
         x = df_info.index
         y_portfolio = df_info["portfolio_value"]
         y_assets = [df_info['price_' + name].cumprod()
-                    for name in self.sim.asset_names]
+                    for name in all_assets]
         self._plot.update(x, y_assets + [y_portfolio])
 
         # plot portfolio weights
         if not self._plot2:
+            self._plot_dir2 = os.path.join(
+                self.log_dir, 'notebook_plot_weights_' + str(time.time())) if self.log_dir else None
             self._plot2 = LivePlotNotebook(
-                '/tmp', labels=self.sim.asset_names, title='weights', ylabel='weight')
-        ys = [df_info['weight_' + name] for name in self.sim.asset_names]
+                log_dir=self._plot_dir2, labels=all_assets, title='weights', ylabel='weight')
+        ys = [df_info['weight_' + name] for name in all_assets]
         self._plot2.update(x, ys)
+
+        # plot portfolio costs
+        if not self._plot3:
+            self._plot_dir3 = os.path.join(
+                self.log_dir, 'notebook_plot_cost_' + str(time.time())) if self.log_dir else None
+            self._plot3 = LivePlotNotebook(
+                log_dir=self._plot_dir3, labels=['cost'], title='costs', ylabel='cost')
+        ys = [df_info['cost'].cumsum()]
+        self._plot3.update(x, ys)
 
         if close:
             self._plot = self._plot2 = self._plot3 = None
